@@ -656,8 +656,469 @@ python rollout.py --rollout_num 5
 
 ---
 
-## 参考资源
+## 8. 模型结构深度解析
+
+### 8.1 完整数据流图
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        MeshGraphNet 完整数据流                              │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  原始输入                                                                   │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐                      │
+│  │ mesh_pos     │  │ node_type    │  │ velocity     │                      │
+│  │ [N, 2]       │  │ [N, 1]       │  │ [N, 2]       │                      │
+│  └──────────────┘  └──────────────┘  └──────────────┘                      │
+│         │                │                  │                                │
+│         └────────────────┼──────────────────┘                                │
+│                          ▼                                                   │
+│  ┌───────────────────────────────────────────────────────────────────────┐ │
+│  │                    FpcDataset.__getitem__                             │ │
+│  │  - 加载静态网格数据 (pos, node_type, cells)                           │ │
+│  │  - 加载动态速度数据 (velocity_t, velocity_t+1)                        │ │
+│  │  - 构造 PyG Data: x=[node_type+velocity], face=cells.T                │ │
+│  └───────────────────────────────────────────────────────────────────────┘ │
+│                          │                                                   │
+│                          ▼                                                   │
+│  ┌───────────────────────────────────────────────────────────────────────┐ │
+│  │                    Transformer (T.Compose)                            │ │
+│  │                                                                       │ │
+│  │  FaceToEdge:   face[3,F] → edge_index[2,E]                           │ │
+│  │  Cartesian:    添加 (dx, dy) 作为边特征                                 │ │
+│  │  Distance:     添加 ||dx|| 作为边特征                                   │ │
+│  │                                                                       │ │
+│  │  输出：edge_attr [E, 3] = (dx, dy, distance)                         │ │
+│  └───────────────────────────────────────────────────────────────────────┘ │
+│                          │                                                   │
+│                          ▼                                                   │
+│  ┌───────────────────────────────────────────────────────────────────────┐ │
+│  │                    Simulator.forward()                                │ │
+│  │                                                                       │ │
+│  │  训练模式：                                                           │ │
+│  │  1. 注入噪声：noised_vel = velocity + noise                          │ │
+│  │  2. 构造节点特征：[noised_vel, onehot(node_type)] → [N, 11]          │ │
+│  │  3. 归一化边特征：edge_attr → normalized                             │ │
+│  │  4. GNN 前向传播：predicted_acc_norm                                 │ │
+│  │  5. 计算目标：target_acc = next_vel - noised_vel                     │ │
+│  │  6. 归一化目标：target_acc_norm                                      │ │
+│  │  7. 返回：(predicted_acc_norm, target_acc_norm)                      │ │
+│  │                                                                       │ │
+│  │  推理模式：                                                           │ │
+│  │  1. 构造节点特征：[clean_vel, onehot(node_type)] → [N, 11]           │ │
+│  │  2. 归一化边特征                                                      │ │
+│  │  3. GNN 前向传播：predicted_acc_norm                                 │ │
+│  │  4. 反归一化：predicted_acc = inverse(predicted_acc_norm)            │ │
+│  │  5. 速度积分：next_vel = vel + predicted_acc                         │ │
+│  │  6. 返回：next_vel                                                   │ │
+│  └───────────────────────────────────────────────────────────────────────┘ │
+│                          │                                                   │
+│                          ▼                                                   │
+│  ┌───────────────────────────────────────────────────────────────────────┐ │
+│  │                    EncoderProcesserDecoder                            │ │
+│  │                                                                       │ │
+│  │  Encoder:                                                             │ │
+│  │    node_attr [N,11] → MLP → [N,128]                                  │ │
+│  │    edge_attr [E,3]  → MLP → [E,128]                                  │ │
+│  │                                                                       │ │
+│  │  Processor (×15):                                                     │ │
+│  │    for each GnBlock:                                                 │ │
+│  │      EdgeBlock:  [sender, receiver, edge] → MLP → new_edge          │ │
+│  │      NodeBlock:  [node, agg_edges] → MLP → new_node                 │ │
+│  │      残差：new = old + transformed                                  │ │
+│  │                                                                       │ │
+│  │  Decoder:                                                             │ │
+│  │    node_attr [N,128] → MLP → [N,2] (加速度)                          │ │
+│  └───────────────────────────────────────────────────────────────────────┘ │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 8.2 输入输出维度详细对照表
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        各阶段张量维度变化                                    │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  假设：N=1000 节点，E=6000 边，T=1000 时间步，B=20 batch_size               │
+│                                                                             │
+│  ┌────────────────────┬────────────────┬─────────────────────────────┐     │
+│  │ 数据/操作          │ 输入维度       │ 输出维度                    │     │
+│  ├────────────────────┼────────────────┼─────────────────────────────┤     │
+│  │ FpcDataset[0]      │ -              │ Data(x=[N,3], pos=[N,2],    │     │
+│  │                    │                │ face=[3,F], y=[N,2])        │     │
+│  ├────────────────────┼────────────────┼─────────────────────────────┤     │
+│  │ FaceToEdge         │ face=[3,F]     │ edge_index=[2,E]            │     │
+│  ├────────────────────┼────────────────┼─────────────────────────────┤     │
+│  │ Cartesian          │ pos=[N,2],     │ edge_attr=[E,2]             │     │
+│  │                    │ edge_index     │ (dx, dy)                    │     │
+│  ├────────────────────┼────────────────┼─────────────────────────────┤     │
+│  │ Distance           │ edge_attr[2]   │ edge_attr=[E,3]             │     │
+│  │                    │                │ (dx, dy, dist)              │     │
+│  ├────────────────────┼────────────────┼─────────────────────────────┤     │
+│  │ update_node_attr   │ vel=[N,2],     │ node_attr=[N,11]            │     │
+│  │                    │ type=[N,1]     │                             │     │
+│  ├────────────────────┼────────────────┼─────────────────────────────┤     │
+│  │ Encoder            │ node=[N,11],   │ node=[N,128],               │     │
+│  │                    │ edge=[E,3]     │ edge=[E,128]                │     │
+│  ├────────────────────┼────────────────┼─────────────────────────────┤     │
+│  │ GnBlock (×15)      │ node=[N,128],  │ node=[N,128],               │     │
+│  │                    │ edge=[E,128]   │ edge=[E,128]                │     │
+│  ├────────────────────┼────────────────┼─────────────────────────────┤     │
+│  │ Decoder            │ node=[N,128]   │ acc=[N,2]                   │     │
+│  ├────────────────────┼────────────────┼─────────────────────────────┤     │
+│  │ output_normalizer  │ acc=[N,2]      │ acc_norm=[N,2]              │     │
+│  │ .inverse()         │ acc_norm=[N,2] │ acc=[N,2]                   │     │
+│  └────────────────────┴────────────────┴─────────────────────────────┘     │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 8.3 消息传递机制详解
+
+```
+Graph Network 消息传递公式 (对应 GnBlock):
+
+┌─────────────────────────────────────────────────────────────────┐
+│                    单次消息传递 (1 个 GnBlock)                    │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  Edge Update (EdgeBlock):                                      │
+│  ─────────────────────                                         │
+│  e'ᵢⱼ = MLPₑ(hᵢ, hⱼ, eᵢⱼ)                                      │
+│                                                                 │
+│  其中:                                                         │
+│    hᵢ  = sender 节点特征                                       │
+│    hⱼ  = receiver 节点特征                                     │
+│    eᵢⱼ = 边 (i→j) 的特征                                        │
+│    e'ᵢⱼ = 更新后的边特征                                        │
+│                                                                 │
+│  Node Update (NodeBlock):                                      │
+│  ───────────────────                                           │
+│  h'ⱼ = MLPₙ(hⱼ, Σᵢ∈N(j) e'ᵢⱼ)                                │
+│                                                                 │
+│  其中:                                                         │
+│    hⱼ  = 节点 j 的原始特征                                      │
+│    N(j) = 所有以 j 为接收者的发送者节点集合                     │
+│    Σ = scatter_add (累加所有入边特征)                          │
+│    h'ⱼ = 更新后的节点特征                                       │
+│                                                                 │
+│  Residual Connection:                                          │
+│  ───────────────────                                           │
+│  hⱼ = hⱼ + h'ⱼ                                                 │
+│  eᵢⱼ = eᵢⱼ + e'ᵢⱼ                                              │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+
+15 层消息传递的感受野:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+层数    聚合范围          说明
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1       1 跳邻域         直接相邻节点
+2       2 跳邻域         邻居的邻居
+3       3 跳邻域         ...
+...
+15      ~15 跳邻域       几乎覆盖整个计算域
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+对于典型圆柱绕流网格 (约 2000 节点):
+- 15 跳足以让圆柱表面的信息传播到尾流区域
+- 这是选择 15 层的经验依据
+```
+
+### 8.4 边界条件处理机制
+
+```
+边界条件实现方式:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. 训练时的隐式学习:
+   - 边界节点类型 (INFLOW, WALL 等) 作为 one-hot 输入
+   - 模型学习"看到"这些类型时应输出的速度模式
+
+2. 推理时的显式约束 (rollout.py):
+   ```python
+   # 识别需要固定的节点 (非 NORMAL 且非 OUTFLOW)
+   mask = (node_type != NORMAL) & (node_type != OUTFLOW)
+   
+   # 强制重置为边界条件值
+   predicted_velocity[mask] = boundary_value[mask]
+   ```
+
+边界类型与典型速度约束:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+类型              速度约束              物理意义
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+INFLOW (4)       v = v_inlet (给定)    入口来流条件
+WALL_BOUNDARY (6) v = 0 (无滑移)      固壁边界
+OBSTACLE (1)     v = 0 (无滑移)      障碍物表面
+AIRFOIL (2)      v = 0 (无滑移)      翼型表面
+OUTFLOW (5)      ∂v/∂n = 0 (自由出流) 出口，模型预测
+NORMAL (0)       -                    流体区域，模型预测
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+```
+
+---
+
+## 9. 示例 Case 集合
+
+### Case 1: 单步推理 (未训练模型)
+
+```python
+"""
+场景：快速测试模型接口是否正常工作
+目的：验证数据流通过程，不关心预测质量
+"""
+import torch
+from model.simulator import Simulator
+from torch_geometric.data import Data
+
+# 1. 创建随机模型
+model = Simulator(
+    message_passing_num=15,
+    node_input_size=11,
+    edge_input_size=3,
+    device='cpu'
+)
+model.eval()
+
+# 2. 创建测试数据
+N, E = 100, 300  # 100 节点，300 边
+graph = Data(
+    x=torch.randn(N, 11),           # 随机节点特征
+    pos=torch.randn(N, 2),          # 随机位置
+    edge_index=torch.randint(0, N, (2, E)),  # 随机边
+    edge_attr=torch.randn(E, 3),    # 随机边特征
+    y=torch.randn(N, 2)             # 随机目标
+)
+
+# 3. 推理
+with torch.no_grad():
+    output = model(graph, None)
+
+print(f"输入：{graph.x.shape} → 输出：{output.shape}")
+# 期望输出：torch.Size([100, 11]) → torch.Size([100, 2])
+```
+
+### Case 2: 完整训练 + 推理流程
+
+```python
+"""
+场景：端到端测试整个训练和推理流程
+目的：验证从数据加载到 rollout 的完整链路
+"""
+from dataset import FpcDataset
+from model.simulator import Simulator
+from torch_geometric.loader import DataLoader
+import torch_geometric.transforms as T
+import torch
+
+# 配置
+data_root = "data"
+batch_size = 4
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+# 1. 加载数据
+dataset = FpcDataset(data_root, split='train')
+loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+
+# 2. 创建模型
+model = Simulator(
+    message_passing_num=15,
+    node_input_size=11,
+    edge_input_size=3,
+    device=device
+).to(device)
+
+# 3. 预处理变换
+transformer = T.Compose([
+    T.FaceToEdge(),
+    T.Cartesian(norm=False),
+    T.Distance(norm=False)
+])
+
+# 4. 单步训练演示
+optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+model.train()
+
+for batch in loader:
+    batch = transformer(batch).to(device)
+    
+    # 前向传播
+    pred, target = model(batch, velocity_sequence_noise=0.02)
+    
+    # 计算 loss
+    loss = torch.mean((pred - target) ** 2)
+    
+    # 反向传播
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer.step()
+    
+    print(f"Step loss: {loss.item():.6f}")
+    break  # 仅演示一步
+
+# 5. 推理演示
+model.eval()
+with torch.no_grad():
+    sample = dataset[0]
+    sample = transformer(sample).unsqueeze(0).to(device)
+    prediction = model(sample, None)
+    print(f"Prediction shape: {prediction.shape}")
+```
+
+### Case 3: 多步 Rollout 误差分析
+
+```python
+"""
+场景：评估模型长期预测稳定性
+目的：观察误差随时间的累积情况
+"""
+import numpy as np
+import matplotlib.pyplot as plt
+
+def analyze_rollout_error(predicteds, targets):
+    """
+    分析 rollout 误差累积曲线
+    
+    Args:
+        predicteds: [T, N, 2] 预测序列
+        targets: [T, N, 2] 目标序列
+    """
+    T = len(predicteds)
+    errors = []
+    
+    for t in range(T):
+        # 计算当前步的 RMSE
+        mse = np.mean((predicteds[t] - targets[t]) ** 2)
+        rmse = np.sqrt(mse)
+        errors.append(rmse)
+    
+    # 绘制误差曲线
+    plt.figure(figsize=(10, 4))
+    plt.plot(errors, 'b-', linewidth=2)
+    plt.xlabel('Time Step')
+    plt.ylabel('RMSE')
+    plt.title('Rollout Error Accumulation')
+    plt.grid(True, alpha=0.3)
+    plt.savefig('rollout_error.png')
+    
+    # 打印关键点
+    for t in [0, T//4, T//2, 3*T//4, T-1]:
+        print(f"Step {t}: RMSE = {errors[t]:.6f}")
+    
+    return errors
+
+# 使用示例 (假设已有 rollout 结果)
+# errors = analyze_rollout_error(predicteds, targets)
+```
+
+### Case 4: 节点类型可视化
+
+```python
+"""
+场景：理解网格中不同节点类型的分布
+目的：直观查看边界条件位置
+"""
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.tri as tri
+
+def visualize_node_types(pos, node_type, cells=None):
+    """
+    可视化节点类型分布
+    """
+    fig, ax = plt.subplots(figsize=(10, 8))
+    
+    # 颜色映射
+    type_names = ['NORMAL', 'OBSTACLE', 'AIRFOIL', 'HANDLE', 
+                  'INFLOW', 'OUTFLOW', 'WALL']
+    colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728',
+              '#9467bd', '#8c564b', '#7f7f7f']
+    
+    # 绘制网格
+    if cells is not None:
+        triang = tri.Triangulation(pos[:, 0], pos[:, 1], triangles=cells)
+        ax.triplot(triang, 'k-', alpha=0.3, lw=0.5)
+    
+    # 按类型绘制节点
+    for nt, name in enumerate(type_names):
+        mask = (node_type.flatten() == nt)
+        if np.any(mask):
+            ax.scatter(pos[mask, 0], pos[mask, 1], 
+                      c=[colors[nt]], label=name, s=50,
+                      edgecolors='black', linewidth=0.5)
+    
+    ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+    ax.set_aspect('equal')
+    ax.set_xlabel('X')
+    ax.set_ylabel('Y')
+    ax.set_title('Node Type Distribution')
+    plt.tight_layout()
+    plt.savefig('node_types.png', dpi=150)
+    plt.show()
+
+# 使用示例
+# visualize_node_types(pos, node_type, cells)
+```
+
+---
+
+## 10. 常见问题与调试技巧
+
+### Q1: 输出全是 NaN 怎么办？
+
+**可能原因**:
+1. 学习率过大 → 尝试降低到 1e-4 或 1e-5
+2. 归一化统计量异常 → 检查 `_acc_count` 是否正常累积
+3. 网格质量问题 → 检查是否有重合节点或退化单元
+
+**调试代码**:
+```python
+# 检查归一化器状态
+print(f"Acc count: {model._output_normalizer._acc_count}")
+print(f"Acc sum: {model._output_normalizer._acc_sum}")
+print(f"Mean: {model._output_normalizer._mean()}")
+print(f"Std: {model._output_normalizer._std_with_epsilon()}")
+```
+
+### Q2: Loss 不下降怎么办？
+
+**检查清单**:
+1. ✅ 确认节点类型 one-hot 编码正确
+2. ✅ 确认边特征已生成 (检查 `graph.edge_attr` 维度)
+3. ✅ 确认 mask 计算正确 (检查 `NodeType` 枚举值)
+4. ✅ 确认噪声注入只在训练时启用
+
+### Q3: 如何调试消息传递过程？
+
+**添加 Hook 观察中间输出**:
+```python
+def register_debug_hooks(model):
+    def make_hook(name):
+        def hook(module, input, output):
+            print(f"{name}:")
+            print(f"  input[0].shape: {input[0].shape}")
+            print(f"  output.shape: {output.shape}")
+            print(f"  output mean: {output.mean().item():.6f}")
+            print(f"  output std: {output.std().item():.6f}")
+        return hook
+    
+    for i, block in enumerate(model.model.processer_list):
+        block.nb_module.register_forward_hook(
+            make_hook(f'GnBlock{i}-NodeBlock')
+        )
+
+# 使用
+register_debug_hooks(model)
+```
+
+---
+
+## 11. 参考资源
 
 - **原论文**: https://arxiv.org/abs/2010.03409
 - **DeepMind 数据**: https://storage.googleapis.com/dm-meshgraphnets/cylinder_flow/
 - **PyTorch Geometric**: https://pytorch-geometric.readthedocs.io/
+- **图神经网络教程**: https://davidstutz.de/lectures-on-graph-neural-networks/
