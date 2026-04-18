@@ -13,8 +13,9 @@ MeshGraphNet 核心模型架构
 └─────────────────────────────────────────────────────────────┘
 """
 
+import torch
 import torch.nn as nn
-from .blocks import EdgeBlock, NodeBlock
+from .blocks import EdgeBlock, NodeBlock, EdgeBlockONNX, NodeBlockONNX, GnBlockONNX
 from torch_geometric.data import Data
 
 
@@ -90,6 +91,36 @@ class Encoder(nn.Module):
         return Data(x=node_, edge_attr=edge_, edge_index=graph.edge_index)
 
 
+class EncoderONNX(nn.Module):
+    """
+    ONNX 兼容的编码器
+
+    功能与原 Encoder 相同，但直接处理张量而非 Data 对象。
+    """
+
+    def __init__(self, edge_input_size=3, node_input_size=11, hidden_size=128):
+        super(EncoderONNX, self).__init__()
+
+        # 边特征编码器 MLP
+        self.eb_encoder = build_mlp(edge_input_size, hidden_size, hidden_size)
+        # 节点特征编码器 MLP
+        self.nb_encoder = build_mlp(node_input_size, hidden_size, hidden_size)
+
+    def forward(self, node_attr: torch.Tensor, edge_attr: torch.Tensor):
+        """
+        ONNX 兼容的前向传播
+
+        Args:
+            node_attr: [N, node_input_size] 节点特征
+            edge_attr: [E, edge_input_size] 边特征
+
+        Returns:
+            (encoded_node_attr, encoded_edge_attr) 元组
+        """
+        encoded_node = self.nb_encoder(node_attr)
+        encoded_edge = self.eb_encoder(edge_attr)
+        return encoded_node, encoded_edge
+
 
 class GnBlock(nn.Module):
     """
@@ -157,6 +188,47 @@ class GnBlock(nn.Module):
 
         return Data(x=x, edge_attr=edge_attr, edge_index=graph.edge_index)
 
+    def forward_onnx(self, node_attr: torch.Tensor, edge_attr: torch.Tensor, edge_index: torch.Tensor, num_nodes: int):
+        """
+        ONNX 兼容的前向传播
+
+        Args:
+            node_attr: [N, hidden_size] 节点特征
+            edge_attr: [E, hidden_size] 边特征
+            edge_index: [2, E] 边索引
+            num_nodes: 节点总数 N
+
+        Returns:
+            (updated_node_attr, updated_edge_attr) 元组
+        """
+        # 保存残差
+        residual_node = node_attr
+        residual_edge = edge_attr
+
+        # 获取边索引
+        senders_idx, receivers_idx = edge_index
+
+        # === EdgeBlock ===
+        # 获取发送者和接收者特征
+        senders_attr = node_attr[senders_idx]
+        receivers_attr = node_attr[receivers_idx]
+        # 拼接并通过 MLP
+        collected_edges = torch.cat([senders_attr, receivers_attr, edge_attr], dim=1)
+        updated_edge = self.eb_module.net(collected_edges)
+
+        # === NodeBlock ===
+        # 聚合入边
+        from .blocks import scatter_add_onnx
+        agg_edges = scatter_add_onnx(updated_edge, receivers_idx, num_nodes)
+        # 拼接并通过 MLP
+        collected_nodes = torch.cat([node_attr, agg_edges], dim=-1)
+        updated_node = self.nb_module.net(collected_nodes)
+
+        # 残差连接
+        updated_node = updated_node + residual_node
+        updated_edge = updated_edge + residual_edge
+
+        return updated_node, updated_edge
 
 
 class Decoder(nn.Module):
@@ -238,8 +310,81 @@ class EncoderProcesserDecoder(nn.Module):
         return decoded
 
 
+class ONNXExportableMeshGraphNet(nn.Module):
+    """
+    可导出 ONNX 的 MeshGraphNet 版本
 
+    由于 PyTorch Geometric 的某些操作 (如 scatter_add) 导出 ONNX 有限制，
+    我们创建一个使用纯 PyTorch 操作的版本用于导出。
 
+    主要特点:
+    1. 直接使用张量而非 Data 对象
+    2. 使用自定义的 scatter_add_onnx 替代 torch_scatter
+    3. 所有维度显式传递，避免动态图结构推断
 
+    输入:
+        - node_attr: [N, 11] 节点特征 (速度 2 + 节点类型 one-hot 9)
+        - edge_attr: [E, 3] 边特征 (dx, dy, distance)
+        - edge_index: [2, E] 边索引
 
+    输出:
+        - [N, 2] 加速度预测
+    """
 
+    def __init__(self, message_passing_num=15, node_input_size=11, edge_input_size=3, hidden_size=128):
+        super(ONNXExportableMeshGraphNet, self).__init__()
+
+        self.node_input_size = node_input_size
+        self.edge_input_size = edge_input_size
+        self.hidden_size = hidden_size
+        self.message_passing_num = message_passing_num
+
+        # 编码器
+        self.node_encoder = build_mlp(node_input_size, hidden_size, hidden_size, lay_norm=True)
+        self.edge_encoder = build_mlp(edge_input_size, hidden_size, hidden_size, lay_norm=True)
+
+        # 处理器 - 使用 ONNX 兼容的 GnBlock
+        self.gn_blocks = nn.ModuleList()
+        for _ in range(message_passing_num):
+            self.gn_blocks.append(GnBlockONNX(hidden_size=hidden_size))
+
+        # 解码器
+        self.decoder = build_mlp(hidden_size, hidden_size, 2, lay_norm=False)
+
+        # 初始化权重
+        self._init_weights()
+
+    def _init_weights(self):
+        """Xavier 初始化权重"""
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+    def forward(self, node_attr: torch.Tensor, edge_attr: torch.Tensor, edge_index: torch.Tensor):
+        """
+        前向传播
+
+        Args:
+            node_attr: [N, 11] 节点特征
+            edge_attr: [E, 3] 边特征
+            edge_index: [2, E] 边索引
+
+        Returns:
+            [N, 2] 加速度预测
+        """
+        N = node_attr.shape[0]
+
+        # 编码
+        node_feat = self.node_encoder(node_attr)
+        edge_feat = self.edge_encoder(edge_attr)
+
+        # 消息传递 (15 层)
+        for block in self.gn_blocks:
+            node_feat, edge_feat = block(node_feat, edge_feat, edge_index, N)
+
+        # 解码
+        output = self.decoder(node_feat)
+
+        return output
