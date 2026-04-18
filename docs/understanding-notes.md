@@ -7,7 +7,19 @@
 3. [核心组件详解](#3-核心组件详解)
 4. [数据流与训练流程](#4-数据流与训练流程)
 5. [关键技术点](#5-关键技术点)
-6. [总结](#6-总结)
+6. [输入数据特点与 Rollout 详解](#6-输入数据特点与-rollout-详解)
+7. [总结](#7-总结)
+8. [模型结构深度解析](#8-模型结构深度解析)
+9. [示例 Case 集合](#9-示例-case-集合)
+10. [常见问题与调试技巧](#10-常见问题与调试技巧)
+11. [ONNX 导出](#11-onnx-导出)
+12. [参考资源](#12-参考资源)
+
+---
+
+**最新更新**:
+- 2026-04-18: 添加 ONNX 导出指南、论文解读文档链接
+- 修复 demo_inference.py rollout 崩溃问题
 
 ---
 
@@ -46,19 +58,29 @@ meshGraphNets_pytorch/
 │   └── fpc.py              # 圆柱绕流数据集加载
 ├── model/
 │   ├── __init__.py
-│   ├── blocks.py           # 基础构建块 (EdgeBlock, NodeBlock)
-│   ├── model.py            # Encoder-Processor-Decoder 架构
+│   ├── blocks.py           # 基础构建块 (EdgeBlock, NodeBlock, ONNX 兼容版本)
+│   ├── model.py            # Encoder-Processor-Decoder 架构 (含 ONNX 导出支持)
 │   └── simulator.py        # 主模拟器模型
 ├── utils/
 │   ├── __init__.py
 │   ├── noise.py            # 噪声注入 (训练技巧)
 │   ├── normalization.py    # 特征归一化
 │   └── utils.py            # 工具类 (节点类型枚举)
+├── docs/
+│   ├── understanding-notes.md           # 详细代码理解笔记
+│   ├── data-structure-explained.md      # 数据结构详解
+│   ├── dataset-analysis.md              # 数据集详细分析
+│   ├── onnx-export-guide.md             # ONNX 导出指南
+│   ├── onnx-export-summary.md           # ONNX 导出总结
+│   └── meshgraphnets-paper-explained.md # 论文入门解读
 ├── parse_tfrecord.py       # TensorFlow 数据解析
 ├── train.py                # 单 GPU 训练
 ├── train_ddp.py            # 多 GPU 分布式训练 (DDP)
 ├── rollout.py              # 长时序推理
 ├── render_results.py       # 结果可视化
+├── demo_inference.py       # 快速推理演示 (支持随机权重/checkpoint)
+├── export_onnx.py          # ONNX 模型导出
+├── test_onnx.py            # ONNX 模型测试
 ├── requirements.txt
 └── README.md
 ```
@@ -220,15 +242,28 @@ def forward(self, graph, velocity_sequence_noise):
         return predicted_acc_norm, target_acc_norm
     else:
         # 推理：清洁速度 → 预测并反归一化
+        # 【关键修复】保存原始 graph.x，推理后恢复
+        # 原因：多步 rollout 时，graph.x 会被覆盖导致 node_type 丢失
+        original_x = graph.x.clone()
+        
         predicted_acc_norm = model(graph)
         acc_update = self._output_normalizer.inverse(predicted_acc_norm)
         predicted_velocity = frames + acc_update
+        
+        # 恢复原始 graph.x（保留 node_type 用于下一次 rollout）
+        graph.x = original_x
+        
         return predicted_velocity
 ```
 
 **关键差异**:
 - 训练时输出 **归一化的加速度** 用于 loss 计算
 - 推理时输出 **下一时刻的速度**
+
+**修复说明** (2026-04-18):
+- **问题**: 之前推理模式下 `graph.x = node_attr` 覆盖了原始数据，导致下一次 rollout 时 `node_type` 变成归一化后的特征值（最大达到 1.48 亿！）
+- **解决**: 保存并恢复原始 `graph.x`，确保每次 rollout 都能正确读取 node_type
+- **测试**: `python demo_inference.py --mode random --rollout_steps 50`
 
 ---
 
@@ -1065,7 +1100,104 @@ def visualize_node_types(pos, node_type, cells=None):
 
 ---
 
-## 10. 常见问题与调试技巧
+## 11. ONNX 导出
+
+### 11.1 为什么需要 ONNX 导出？
+
+| 用途 | 说明 |
+|------|------|
+| **模型可视化** | 使用 Netron 直观查看模型架构 |
+| **跨平台部署** | 在 C++、JavaScript、移动端部署 |
+| **推理加速** | 使用 ONNX Runtime 获得更高性能 |
+| **调试分析** | 检查每一层的输出和中间张量 |
+
+### 11.2 导出挑战与解决方案
+
+MeshGraphNet 基于 PyTorch Geometric，导出 ONNX 面临以下挑战：
+
+| 挑战 | 解决方案 |
+|------|----------|
+| **torch_scatter.scatter_add 不可导出** | 实现纯 PyTorch 版本 `scatter_add_onnx()` |
+| **PyG Data 对象不兼容** | 创建使用张量接口的 `*ONNX` 类 |
+| **动态图结构** | 显式传递 `num_nodes` 参数 |
+
+### 11.3 使用方法
+
+```bash
+# 导出随机权重模型（测试架构）
+python export_onnx.py --output model.onnx
+
+# 导出训练好的模型
+python export_onnx.py --checkpoint checkpoints/best_model.pth --output model.onnx --visualize
+
+# 可视化（使用 Netron）
+pip install netron
+netron model.onnx
+# 或在浏览器打开 https://netron.app/ 并上传 model.onnx
+```
+
+### 11.4 ONNX 模型规格
+
+**输入输出**:
+
+| 名称 | 形状 | 说明 |
+|------|------|------|
+| `node_attr` | `[N, 11]` | 节点特征（速度 2 + 节点类型 one-hot 9） |
+| `edge_attr` | `[E, 3]` | 边特征（dx, dy, distance） |
+| `edge_index` | `[2, E]` | 边索引 |
+| `acceleration` | `[N, 2]` | 加速度预测 |
+
+**模型统计**:
+- 总算子数：~1,200
+- Gemm (全连接): 132 层
+- Relu (激活): 99 层
+- ScatterElements (消息聚合): 15 层
+
+### 11.5 测试 ONNX 推理
+
+```bash
+# 运行测试脚本
+python test_onnx.py
+
+# 预期输出:
+# ✓ 模型加载成功
+# ✓ 推理成功!
+# 平均推理时间：~7.8ms
+```
+
+### 11.6 相关文档
+
+- [`docs/onnx-export-guide.md`](./onnx-export-guide.md) - ONNX 导出详细指南
+- [`docs/onnx-export-summary.md`](./onnx-export-summary.md) - 实现总结
+
+---
+
+## 12. 新增文档说明
+
+### 12.1 论文解读
+
+- **文件**: [`docs/meshgraphnets-paper-explained.md`](./meshgraphnets-paper-explained.md)
+- **内容**: 面向入门者的论文解读
+  - 核心思想：网格→图→GNN 消息传递
+  - 模型架构详解（Encoder-Processor-Decoder）
+  - 关键设计：为什么预测加速度
+  - 训练技巧、实验结果
+  - 入门者学习路径和术语表
+
+### 12.2 数据结构详解
+
+- **文件**: [`docs/data-structure-explained.md`](./data-structure-explained.md)
+- **内容**: 5 种数据类型的详细解释和模型消费流程
+
+### 12.3 数据集分析
+
+- **文件**: [`docs/dataset-analysis.md`](./dataset-analysis.md)
+- **内容**: train/valid/test 三数据集的对比分析
+  - 关键发现：测试集速度范围是训练集的 4 倍（需要外推能力）
+
+---
+
+## 13. 常见问题与调试技巧
 
 ### Q1: 输出全是 NaN 怎么办？
 
@@ -1116,9 +1248,26 @@ register_debug_hooks(model)
 
 ---
 
-## 11. 参考资源
+## 14. 参考资源
+
+### 核心资源
 
 - **原论文**: https://arxiv.org/abs/2010.03409
 - **DeepMind 数据**: https://storage.googleapis.com/dm-meshgraphnets/cylinder_flow/
 - **PyTorch Geometric**: https://pytorch-geometric.readthedocs.io/
 - **图神经网络教程**: https://davidstutz.de/lectures-on-graph-neural-networks/
+
+### 本项目文档
+
+| 文档 | 说明 |
+|------|------|
+| [`understanding-notes.md`](./understanding-notes.md) | 详细代码理解笔记（本文档） |
+| [`data-structure-explained.md`](./data-structure-explained.md) | 数据结构与模型消费流程详解 |
+| [`dataset-analysis.md`](./dataset-analysis.md) | 数据集详细分析（train/valid/test 对比） |
+| [`onnx-export-guide.md`](./onnx-export-guide.md) | ONNX 导出完整指南 |
+| [`meshgraphnets-paper-explained.md`](./meshgraphnets-paper-explained.md) | 论文入门解读 |
+
+### 工具
+
+- **Netron**: https://netron.app/ - ONNX 模型可视化
+- **ONNX Runtime**: https://onnxruntime.ai/ - 跨平台推理加速
