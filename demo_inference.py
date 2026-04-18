@@ -183,19 +183,21 @@ def create_test_graph(pos, cells, node_type, velocity):
     Args:
         pos: 节点位置
         cells: 三角单元
-        node_type: 节点类型
-        velocity: 速度场
+        node_type: 节点类型 [N, 1]
+        velocity: 速度场 [N, 2]
 
     Returns:
         graph: PyG Data 对象
     """
-    x = np.concatenate([node_type, velocity], axis=-1)  # [N, 1+2=3]
+    # node_type 需要是整数类型用于 one_hot 编码
+    node_type_int = node_type.astype(np.int64)  # [N, 1]
+    x = np.concatenate([node_type_int, velocity], axis=-1)  # [N, 1+2=3]
     x = torch.as_tensor(x, dtype=torch.float32)
     pos_tensor = torch.as_tensor(pos, dtype=torch.float32)
     face_tensor = torch.as_tensor(cells.T, dtype=torch.int64)  # [3, num_faces]
 
     # y 占位符 (推理时不需要，但模型可能需要)
-    y = torch.zeros_like(velocity, dtype=torch.float32)
+    y = torch.zeros_like(x[:, :2], dtype=torch.float32)  # [N, 2]
 
     graph = Data(x=x, pos=pos_tensor, face=face_tensor, y=y)
     return graph
@@ -232,16 +234,21 @@ def visualize_results(predicteds, targets, pos, cells, save_path=None):
     v_min = min(target_speed.min(), predicted_speed.min())
 
     # 创建图表
-    fig, axes = plt.subplots(2, min(num_steps, 4), figsize=(4 * min(num_steps, 4), 8))
-    if num_steps == 1:
-        axes = axes.reshape(2, 1)
+    num_cols = min(num_steps, 4)
+    fig, axes = plt.subplots(2, num_cols, figsize=(4 * num_cols, 8))
 
-    steps_to_show = [0, num_steps // 3, 2 * num_steps // 3, num_steps - 1]
-    steps_to_show = steps_to_show[:min(num_steps, 4)]
+    # 处理 axes 维度
+    if num_cols == 1:
+        axes = np.array([[axes[0], axes[1]]]).T  # reshape to (2, 1)
+    elif num_cols == 2:
+        axes = axes.reshape(2, 2)
+    # num_cols >= 3 时 axes 已经是 (2, num_cols)
+
+    steps_to_show = list(range(num_cols))
 
     for j, step in enumerate(steps_to_show):
         # 目标
-        ax = axes[0, j] if num_steps > 1 else axes[0]
+        ax = axes[0, j]
         ax.triplot(triang, 'k-', alpha=0.3, lw=0.5)
         cf = ax.tripcolor(triang, target_speed[step], vmin=v_min, vmax=v_max)
         ax.set_title(f'Target (step {step})')
@@ -250,7 +257,7 @@ def visualize_results(predicteds, targets, pos, cells, save_path=None):
         plt.colorbar(cf, ax=ax)
 
         # 预测
-        ax = axes[1, j] if num_steps > 1 else axes[1]
+        ax = axes[1, j]
         ax.triplot(triang, 'k-', alpha=0.3, lw=0.5)
         cf = ax.tripcolor(triang, predicted_speed[step], vmin=v_min, vmax=v_max)
         ax.set_title(f'Prediction (step {step})')

@@ -212,6 +212,9 @@ class Simulator(nn.Module):
 
         else:
             # ========== 推理模式 ==========
+            # 保存原始 graph.x 用于恢复
+            original_x = graph.x.clone()
+
             # 使用干净的速度 (无噪声)
             node_attr = self.update_node_attr(frames, node_type)
             graph.x = node_attr
@@ -229,4 +232,8 @@ class Simulator(nn.Module):
 
             # 速度积分：v(t+1) = v(t) + a(t)
             predicted_velocity = frames + acc_update
+
+            # 恢复原始 graph.x (保留 node_type 用于下一次 rollout)
+            graph.x = original_x
+
             return predicted_velocity
