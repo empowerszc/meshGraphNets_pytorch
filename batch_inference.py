@@ -74,6 +74,9 @@ def parse_args():
                         help='每条轨迹推理的步数 (默认 None=完整轨迹，约 600 步；可设置更小的值节省内存)')
     parser.add_argument('--data-dir', type=str, default='data',
                         help='数据集目录 (默认 data)')
+    parser.add_argument('--split', type=str, default='test',
+                        choices=['test', 'valid', 'train'],
+                        help='数据集划分 (默认 test)')
     parser.add_argument('--device', type=str, default='auto',
                         choices=['auto', 'cuda', 'cpu'],
                         help='设备选择')
@@ -94,6 +97,16 @@ def parse_args():
                         help='详细日志输出')
 
     return parser.parse_args()
+
+
+def get_split_display_name(split: str) -> str:
+    """获取数据集划分的显示名称"""
+    names = {
+        'test': '测试集',
+        'valid': '验证集',
+        'train': '训练集'
+    }
+    return names.get(split, split)
 
 
 def detect_device(device_arg):
@@ -224,6 +237,7 @@ def main():
     print(f"设备：{args.device}")
     print(f"轨迹数量：{args.num_samples}")
     print(f"Batch size: {args.batch_size}")
+    print(f"数据集：{get_split_display_name(args.split)} ({args.split})")
     print(f"每条轨迹推理步数：{args.num_steps if args.num_steps else '完整轨迹 (约 600 步)'}")
     print(f"模型权重：{'随机初始化' if args.random else args.checkpoint}")
 
@@ -244,11 +258,11 @@ def main():
     print_section("2. 加载数据")
 
     # 检查真实数据集是否存在
-    test_path = Path(args.data_dir) / 'test.npz'
-    use_synthetic = not test_path.exists()
+    split_path = Path(args.data_dir) / f'{args.split}.npz'
+    use_synthetic = not split_path.exists()
 
     if use_synthetic:
-        print(f"⚠️  未找到真实数据集 ({args.data_dir}/test.npz 不存在)")
+        print(f"⚠️  未找到真实数据集 ({args.data_dir}/{args.split}.npz 不存在)")
         print("   使用合成数据进行测试")
 
         # 导入合成数据生成函数
@@ -295,8 +309,8 @@ def main():
         dataset = SyntheticDataset(pos, cells, node_type, num_tras=args.num_samples + 1)
         print(f"合成数据集：{dataset.num_tras} 条轨迹，每条 {dataset.tra_len} 步")
     else:
-        dataset = FpcDataset(data_root=args.data_dir, split='test')
-    print(f"测试集总样本数：{len(dataset)}")
+        dataset = FpcDataset(data_root=args.data_dir, split=args.split)
+    print(f"{get_split_display_name(args.split)}总样本数：{len(dataset)}")
     print(f"每条轨迹时间步数：{dataset.tra_len}")
     print(f"每条轨迹样本数：{dataset.num_sampes_per_tra}")
 
