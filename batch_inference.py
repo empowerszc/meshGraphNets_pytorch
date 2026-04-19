@@ -362,8 +362,9 @@ def main():
     print_section("4. 开始 Batch 推理")
 
     num_batches = (args.num_samples + args.batch_size - 1) // args.batch_size
-    all_latencies = []
+    all_batch_times = []
     all_throughputs = []
+    total_samples = 0
 
     # 应用 PyG 变换（生成边特征）
     transformer = T.Compose([
@@ -390,28 +391,32 @@ def main():
 
         print(f"\nBatch {batch_idx + 1}/{num_batches} ({current_batch_size} 轨迹，{len(batch_graphs)} 样本)")
 
-        # Batch 推理
-        latencies = []
-        for i, graph in enumerate(batch_graphs):
-            graph = graph.to(device)
+        # Batch 推理 - 使用 PyG Batch 打包所有图进行并行推理
+        batch_start_time = time.time()
 
-            step_start = time.time()
-            with torch.no_grad():
-                predicted_velocity = model(graph, None)
-            step_time = (time.time() - step_start) * 1000  # ms
-            latencies.append(step_time)
+        # 使用 Batch.from_data_list 将所有图打包成一个 batched_graph
+        # 这样可以利用 GPU/CPU 并行计算，而不是逐个推理
+        batched_graph = Batch.from_data_list([g.to(device) for g in batch_graphs])
 
-            if args.verbose and (i + 1) % 100 == 0:
-                print(f"  样本 {i + 1}/{len(batch_graphs)} - 延迟：{step_time:.2f}ms")
+        with torch.no_grad():
+            batched_prediction = model(batched_graph, None)  # [N_total, 2]
 
         batch_time = time.time() - batch_start_time
-        avg_latency = sum(latencies) / len(latencies)
+
+        # 计算统计信息
+        batch_latency = batch_time * 1000  # ms
         throughput = len(batch_graphs) / batch_time if batch_time > 0 else 0
 
-        all_latencies.extend(latencies)
-        all_throughputs.append(throughput)
+        print(f"  Batch 并行推理完成：{len(batch_graphs)} 样本 | "
+              f"Batch 耗时：{batch_time:.2f}s | "
+              f"吞吐量：{throughput:.2f} 样本/s")
 
-        print(f"  Batch 耗时：{batch_time:.2f}s | 平均延迟：{avg_latency:.2f}ms | 吞吐量：{throughput:.2f} 样本/s")
+        # 可选：将 batched_prediction 拆分成单个结果用于后续处理
+        # predicted_velocities = torch.split(batched_prediction, [g.num_nodes for g in batch_graphs])
+
+        all_batch_times.append(batch_time)
+        all_throughputs.append(throughput)
+        total_samples += len(batch_graphs)
 
         # 可视化（可选）
         if args.save_vis and batch_idx < 3:  # 只可视化前 3 个 batch
@@ -428,18 +433,22 @@ def main():
     # ========== 5. 统计结果 ==========
     print_section("5. 推理统计")
 
-    total_time = sum(all_latencies) / 1000  # s
-    total_samples = len(all_latencies)
-    avg_latency = np.mean(all_latencies)
-    min_latency = np.min(all_latencies)
-    max_latency = np.max(all_latencies)
+    total_time = sum(all_batch_times)  # s
+    avg_batch_time = np.mean(all_batch_times) * 1000  # ms
+    min_batch_time = np.min(all_batch_times) * 1000  # ms
+    max_batch_time = np.max(all_batch_times) * 1000  # ms
+
+    # 计算平均每样本延迟（batch 时间 / batch 内样本数）
+    avg_latency_per_sample = (total_time / total_samples * 1000) if total_samples > 0 else 0
     overall_throughput = total_samples / total_time if total_time > 0 else 0
 
+    print(f"总批次：{num_batches}")
     print(f"总样本数：{total_samples}")
     print(f"总耗时：{total_time:.2f}s")
-    print(f"平均延迟：{avg_latency:.2f}ms")
-    print(f"最小延迟：{min_latency:.2f}ms")
-    print(f"最大延迟：{max_latency:.2f}ms")
+    print(f"平均 Batch 耗时：{avg_batch_time:.2f}ms")
+    print(f"平均每样本延迟：{avg_latency_per_sample:.2f}ms")
+    print(f"最小 Batch 耗时：{min_batch_time:.2f}ms")
+    print(f"最大 Batch 耗时：{max_batch_time:.2f}ms")
     print(f"吞吐量：{overall_throughput:.2f} 样本/s")
 
     # ========== 6. 保存结果 ==========
@@ -450,11 +459,13 @@ def main():
         'num_trajectories': args.num_samples,
         'batch_size': args.batch_size,
         'num_steps_per_trajectory': args.num_steps,
+        'num_batches': num_batches,
         'total_samples': total_samples,
         'total_time_sec': total_time,
-        'avg_latency_ms': avg_latency,
-        'min_latency_ms': min_latency,
-        'max_latency_ms': max_latency,
+        'avg_batch_time_ms': avg_batch_time,
+        'avg_latency_per_sample_ms': avg_latency_per_sample,
+        'min_batch_time_ms': min_batch_time,
+        'max_batch_time_ms': max_batch_time,
         'throughput_samples_per_sec': overall_throughput,
         'device': device_name
     }
@@ -465,10 +476,10 @@ def main():
         json.dump(stats, f, indent=2)
     print(f"统计信息已保存：{stats_path}")
 
-    # 保存详细延迟数据
-    latency_path = os.path.join(args.output_dir, 'latencies.npy')
-    np.save(latency_path, np.array(all_latencies))
-    print(f"延迟数据已保存：{latency_path}")
+    # 保存详细 batch 时间数据
+    batch_times_path = os.path.join(args.output_dir, 'batch_times.npy')
+    np.save(batch_times_path, np.array(all_batch_times))
+    print(f"Batch 时间数据已保存：{batch_times_path}")
 
     print_header("推理完成!")
     print(f"结果目录：{args.output_dir}")
