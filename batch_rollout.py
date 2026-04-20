@@ -63,7 +63,7 @@ def parse_args():
     parser.add_argument('--output-dir', type=str,
                         default=f'outputs/batch_rollout/{datetime.now().strftime("%Y%m%d_%H%M%S")}')
     parser.add_argument('--save-results', action='store_true',
-                        help='保存完整推理结果')
+                        help='保存完整推理结果 (pkl 格式，与 rollout.py 兼容)')
     parser.add_argument('--verbose', action='store_true',
                         help='详细日志')
     return parser.parse_args()
@@ -254,6 +254,9 @@ def main():
     # ========== 7. 保存 ==========
     print_section("6. 保存结果")
 
+    # 获取网格坐标（所有轨迹共用）
+    crds = dataset[0].pos.cpu().numpy()
+
     # 统计信息
     stats = {
         'num_trajectories': args.num_samples,
@@ -269,21 +272,31 @@ def main():
         json.dump(stats, f, indent=2)
     print(f"统计信息：{args.output_dir}/statistics.json")
 
-    # 完整结果
+    # 完整结果（与 rollout.py 兼容的格式）
     if args.save_results:
-        results = {
-            'predicteds': [np.stack(p) for p in all_predicteds],
-            'targets': [np.stack(t) for t in all_targets],
-            'rmse_curves': rmse_array
-        }
-        with open(f'{args.output_dir}/results.pkl', 'wb') as f:
-            pickle.dump(results, f)
-        print(f"完整结果：{args.output_dir}/results.pkl")
+        os.makedirs(f'{args.output_dir}/results', exist_ok=True)
 
-    # RMSE 曲线
-    with open(f'{args.output_dir}/rmse_curves.npy', 'wb') as f:
-        np.save(f, rmse_array)
-    print(f"RMSE 曲线：{args.output_dir}/rmse_curves.npy")
+        for i in range(args.num_samples):
+            # 堆叠为 [num_steps, N, 2]
+            result = [np.stack(all_predicteds[i]), np.stack(all_targets[i])]
+
+            # 保存为 result/result{index}.pkl，与 rollout.py 格式一致
+            pkl_path = f'{args.output_dir}/results/result{i}.pkl'
+            with open(pkl_path, 'wb') as f:
+                pickle.dump([result, crds], f)
+            print(f"  轨迹 {i}: {pkl_path}")
+
+        # 额外保存汇总文件（包含所有轨迹的 RMSE）
+        summary = {
+            'results': [
+                {'index': i, 'rmse': rmse_curves[i].tolist()}
+                for i in range(args.num_samples)
+            ],
+            'crds': crds
+        }
+        with open(f'{args.output_dir}/results/summary.pkl', 'wb') as f:
+            pickle.dump(summary, f)
+        print(f"  汇总：{args.output_dir}/results/summary.pkl")
 
     print_header("完成!")
 
