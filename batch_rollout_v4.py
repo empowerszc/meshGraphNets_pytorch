@@ -122,7 +122,8 @@ def main():
     print("正在加载数据到内存...")
     start_load = time.time()
 
-    all_velocities = []      # List[[num_steps, N_i, 2]] - 每条轨迹的速度
+    all_velocities = []      # List[[num_steps, N_i, 2]] - 每条轨迹的输入速度
+    all_targets = []         # List[[num_steps, N_i, 2]] - 每条轨迹的真值速度（下一帧）
     all_positions = []       # List[[N_i, 2]] - 每条轨迹的位置
     all_cells = []           # List[[F_i, 3]] - 每条轨迹的网格
     all_node_types = []      # List[[N_i, 1]] - 每条轨迹的节点类型
@@ -131,7 +132,8 @@ def main():
     for tra_idx in range(args.num_samples):
         # 获取该轨迹的速度数据
         start_idx = tra_idx * num_steps
-        velocities = []
+        input_velocities = []    # 当前帧速度（输入）
+        target_velocities = []   # 下一帧速度（真值）
         for step in range(num_steps):
             graph = dataset[start_idx + step]
             if step == 0:
@@ -145,11 +147,13 @@ def main():
                     node_type == NodeType.OUTFLOW
                 )
                 boundary_masks.append(torch.logical_not(predict_mask))
-            velocities.append(graph.y.clone())
+            # 保存当前帧速度（输入）和下一帧速度（真值）
+            input_velocities.append(graph.x[:, 1:3].clone())
+            target_velocities.append(graph.y.clone())
 
         # 堆叠为 [num_steps, N, 2]
-        vel_tensor = torch.stack(velocities, dim=0)
-        all_velocities.append(vel_tensor)
+        all_velocities.append(torch.stack(input_velocities, dim=0))
+        all_targets.append(torch.stack(target_velocities, dim=0))
 
     load_time = time.time() - start_load
     print(f"加载完成：{load_time:.2f}s, {len(all_velocities)} 条轨迹")
@@ -186,12 +190,12 @@ def main():
     current_velocities = [vel[0].clone() for vel in all_velocities]  # [N, 2]
 
     all_predicteds = [[] for _ in range(args.num_samples)]
-    all_targets = [[] for _ in range(args.num_samples)]
+    all_results_targets = [[] for _ in range(args.num_samples)]  # 保存 rollout 结果的真值
 
     # 按时间步循环（串行）
     for step in range(num_steps):
-        # 获取所有轨迹的当前步速度
-        step_velocities = [all_velocities[tra_idx][step] for tra_idx in range(args.num_samples)]
+        # 获取所有轨迹的当前步真值速度（用于边界约束和保存）
+        step_targets = [all_targets[tra_idx][step] for tra_idx in range(args.num_samples)]
 
         # 分 batch 处理
         for batch_start in range(0, args.num_samples, args.batch_size):
@@ -200,25 +204,22 @@ def main():
             # 构建当前 batch 的图（每条轨迹用自己的网格）
             batch_graphs = []
             for tra_idx in range(batch_start, batch_end):
+                # 自回归输入：step=0 用初始速度，step>0 用上一帧预测值
+                input_velocity = current_velocities[tra_idx]
+
                 graph = Data(
                     x=torch.cat([
                         all_node_types[tra_idx],  # [N_i, 1]
-                        current_velocities[tra_idx],  # [N_i, 2]
+                        input_velocity,  # [N_i, 2]
                     ], dim=-1),
                     pos=all_positions[tra_idx],
                     face=all_cells[tra_idx].t().contiguous()
                 )
-                graph.y = step_velocities[tra_idx]  # 真值
+                graph.y = step_targets[tra_idx]  # 真值（下一帧速度）
                 batch_graphs.append(graph)
 
             # 应用变换
             batch_graphs = [transformer(g).to(device) for g in batch_graphs]
-
-            # 自回归输入：更新速度
-            for i, graph in enumerate(batch_graphs):
-                tra_idx = batch_start + i
-                if step > 0:
-                    graph.x[:, 1:3] = current_velocities[tra_idx].to(device)
 
             # 打包成 batch
             batched = Batch.from_data_list(batch_graphs)
@@ -236,14 +237,14 @@ def main():
                 tra_idx = batch_start + i
 
                 pred = pred.clone()
-                pred[boundary_masks[tra_idx].to(device)] = step_velocities[tra_idx].to(device)[boundary_masks[tra_idx].to(device)]
+                pred[boundary_masks[tra_idx].to(device)] = step_targets[tra_idx].to(device)[boundary_masks[tra_idx].to(device)]
 
                 # 更新下一帧输入
                 current_velocities[tra_idx] = pred.cpu()
 
                 # 保存结果
                 all_predicteds[tra_idx].append(pred.cpu().numpy())
-                all_targets[tra_idx].append(step_velocities[tra_idx].numpy())
+                all_results_targets[tra_idx].append(step_targets[tra_idx].numpy())
 
         if args.verbose and (step + 1) % 50 == 0:
             print(f"  Step {step + 1}/{num_steps}")
@@ -257,7 +258,7 @@ def main():
 
     rmse_curves = []
     for i in range(args.num_samples):
-        rmse = compute_rollout_error(all_predicteds[i], all_targets[i])
+        rmse = compute_rollout_error(all_predicteds[i], all_results_targets[i])
         rmse_curves.append(rmse)
 
     rmse_array = np.array(rmse_curves)
@@ -268,10 +269,10 @@ def main():
 
     if args.save_results:
         os.makedirs(f'{args.output_dir}/results', exist_ok=True)
-        crds = pos.cpu().numpy()
+        crds = all_positions[0].cpu().numpy()
 
         for i in range(args.num_samples):
-            result = [np.stack(all_predicteds[i]), np.stack(all_targets[i])]
+            result = [np.stack(all_predicteds[i]), np.stack(all_results_targets[i])]
             with open(f'{args.output_dir}/results/result{i}.pkl', 'wb') as f:
                 pickle.dump([result, crds], f)
 
