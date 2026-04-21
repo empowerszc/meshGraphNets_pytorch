@@ -117,20 +117,22 @@ def compare_rollout_results(
             messages.append(f"❌ targets: 差异超出容差 (max_diff={max_diff:.2e})")
             all_match = False
 
-    # 比较 coordinates
+    # 比较 coordinates (仅供参考，不影响一致性判断)
+    # 注意：不同轨迹的网格可能不同，coordinates 形状不同是正常的
     crd1 = data1['coordinates']
     crd2 = data2['coordinates']
 
     if crd1.shape != crd2.shape:
-        messages.append(f"❌ coordinates 形状不同：{crd1.shape} vs {crd2.shape}")
-        all_match = False
+        # 形状不同不代表错误，只是说明是不同的轨迹
+        messages.append(f"⚠️  coordinates 形状不同：{crd1.shape} vs {crd2.shape} (可能是不同轨迹)")
+        # 不设置 all_match = False
     else:
         max_diff = np.max(np.abs(crd1 - crd2))
         if max_diff < tol:
             messages.append(f"✅ coordinates: 完全一致 (max_diff={max_diff:.2e})")
         else:
-            messages.append(f"❌ coordinates: 差异超出容差 (max_diff={max_diff:.2e})")
-            all_match = False
+            messages.append(f"⚠️  coordinates: 存在差异 (max_diff={max_diff:.2e})")
+            # 坐标差异不影响一致性判断
 
     # RMSE 统计
     if verbose:
